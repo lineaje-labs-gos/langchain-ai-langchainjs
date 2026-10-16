@@ -1,65 +1,153 @@
-name: 🦋 Changesets Release
-
-# Called by publish.yml (the npm Trusted Publisher entry point)
-on:
-  workflow_call:
-
+name: Publish Workflow
 permissions:
   contents: read
 
-env:
-  CI: true
-  NPM_CONFIG_PROVENANCE: true
+on:
+  push:
+    tag:
+      - v* 
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description:  Provide the tag to publish the package
+        required: false
+      fixed_cves:
+        description:  Provide the list of CVEs fixed by this version
+        required: false
 
 jobs:
-  release:
-    name: 🦋 Changesets Release
-    if: github.repository == 'langchain-ai/langchainjs'
+  build_test:
     runs-on: ubuntu-latest
-    outputs:
-      published_packages: ${{ steps.changesets.outputs.published-packages }}
-      published: ${{ steps.changesets.outputs.published }}
-    permissions:
-      contents: write # enable pushing changes to the origin
-      id-token: write # enable generation of an ID token for publishing
-      pull-requests: write # enable opening a PR for the release
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
+
     steps:
-      - name: ⬇️ Checkout repo
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    
+      - name: Check out code
+        uses: actions/checkout@v4.1.7
         with:
-          fetch-depth: 0
+          ref: ${{ github.event.inputs.release_version }}
+          submodules: true
 
-      - name: 📦 Setup pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-
-      - name: ⎔ Setup node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
         with:
-          node-version-file: ".nvmrc"
-          cache: "pnpm"
+          node-version: '20'
 
-      - name: 📥 Install deps
-        run: pnpm install --frozen-lockfile
+      - name: Install JFrog CLI
+        run: curl -fL https://install-cli.jfrog.io | sh
 
-      - name: 🔐 Setup npm auth
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Clear npm cache
+        run: npm cache clean --force
+
+      - name: Configure .npmrc for JFrog
         run: |
-          echo "registry=https://registry.npmjs.org" >> ~/.npmrc
-          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+          echo "registry=https://${{ secrets.JFROG_HOST_NAME }}/artifactory/api/npm/${{ secrets.NPM_GOS_ALL_ARTIFACTORY }}/" > ~/.npmrc
+          echo "//${{ secrets.JFROG_HOST_NAME }}/artifactory/api/npm/${{ secrets.NPM_GOS_ALL_ARTIFACTORY }}/:_authToken=${{ secrets.CUSTOMER_ZERO_TOKEN }}" >> ~/.npmrc
+          echo "always-auth=true" >> ~/.npmrc
 
-        # This action has two responsibilities. The first time the workflow runs
-        # it will create a new branch and then open a PR with the related changes
-        # for the new version. After the PR is merged, the workflow will run again
-        # and this action will build + publish to npm.
-      - name: 🚀 PR / Publish
-        id: changesets
-        uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51
+
+      - name: Install dependencies for Node
+        run: npm install 2>&1 | tee npm-install.log
+
+      - name: Upload npm install log to Artifactory
+        run: |
+          PROJECT_NAME=${GITHUB_REPOSITORY##*/}
+          jf rt u "npm-install.log" "${{ secrets.NPM_STAGING_ARTIFACTORY }}/logs/build_test/${PROJECT_NAME}-${{ github.event.inputs.release_version  }}/" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token=${{ secrets.JFROG_PASSWORD }}
+         
+      - name: Run tests if available
+        run: |
+          if [ "$(node -p "require('./package.json').scripts?.test")" != "undefined" ]; then
+            echo "Running tests..."
+            npm test 2>&1 | tee npm-test.log
+            PROJECT_NAME=${GITHUB_REPOSITORY##*/}
+            jf rt u "npm-test.log" "${{ secrets.NPM_STAGING_ARTIFACTORY }}/logs/build_test/${PROJECT_NAME}-${{ github.event.inputs.release_version  }}/" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token=${{ secrets.JFROG_PASSWORD }}
+          else
+            echo "No test script found, skipping."
+          fi
+
+  publish:
+    needs: build_test
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.1.7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          version-script: pnpm run changeset:version
-          commit-message: "chore: version packages"
-          pr-title: "chore: version packages"
-          publish-script: pnpm run release
+          ref: ${{ github.event.inputs.release_version }}
+          submodules: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      
+      - name: Install JFrog CLI
+        run: curl -fL https://install-cli.jfrog.io | sh
+
+      - name: Install dependencies for Node
+        run: npm install
+
+      - name: Read version and package
+        run: |
+          PACKAGE_FILENAME=$(npm pack --pack-destination ./ | grep -E '^[a-z]' | head -n 1)
+          echo "PACKAGE_FILENAME=$PACKAGE_FILENAME" >> $GITHUB_ENV
+
+      - name: Import GPG private key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import --pinentry-mode loopback
+
+      - name: Sign the .tgz package file
+        run: |
+          gpg --yes --pinentry-mode loopback \
+          --armor --detach-sign --local-user "${{ secrets.GPG_KEY_ID }}" "$PACKAGE_FILENAME"
+
+      - name: Configure .npmrc for JFrog
+        run: |
+          echo "registry=https://${{ secrets.JFROG_HOST_NAME }}/artifactory/api/npm/${{ secrets.NPM_STAGING_ARTIFACTORY }}/" > ~/.npmrc
+          echo "//${{ secrets.JFROG_HOST_NAME }}/artifactory/api/npm/${{ secrets.NPM_STAGING_ARTIFACTORY }}/:_authToken=${{ secrets.JFROG_PASSWORD }}" >> ~/.npmrc
+          echo "always-auth=true" >> ~/.npmrc
+
+      - name: Publish package to JFrog
+        run: npm publish "$PACKAGE_FILENAME" 2>&1 | tee npm-publish.log
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.JFROG_PASSWORD }}
+
+      - name: Extract published package path
+        id: published_pkg
+        run: |
+          LAST_LINE=$(tail -1 npm-publish.log)
+          if [[ "$LAST_LINE" != +* ]]; then
+            echo "ERROR: Unexpected npm publish output: $LAST_LINE"
+            exit 1
+          fi
+          # Extract full "name@version" by stripping leading "+ "
+          PKG_FULL=$(echo "$LAST_LINE" | sed 's/^+ //')
+          # Extract version (everything after the last @)
+          PKG_VERSION=$(echo "$PKG_FULL" | awk -F'@' '{print $NF}')
+          # Extract name (strip the @version suffix)
+          PKG_NAME=$(echo "$PKG_FULL" | sed "s/@${PKG_VERSION}$//")
+          PKG_FILENAME="${PKG_NAME}-${PKG_VERSION}.tgz"
+          ARTIFACT_PATH="${PKG_NAME}/-/${PKG_FILENAME}"
+
+          echo "artifact_path=$ARTIFACT_PATH" >> $GITHUB_OUTPUT
+          echo "pkg_name=$PKG_NAME" >> $GITHUB_OUTPUT
+          echo "pkg_version=$PKG_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload publish log to Artifactory
+        run: |
+          jf rt u "npm-publish.log" "${{ secrets.NPM_STAGING_ARTIFACTORY }}/logs/publish/${{ steps.published_pkg.outputs.pkg_name }}-${{ steps.published_pkg.outputs.pkg_version }}/" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token=${{ secrets.JFROG_PASSWORD }}
+
+      - name: Upload signature file to Artifactory
+        run: |
+          # Avoid setting additional vcs properties so that only one callback is executed
+          export JFROG_CLI_CI_VCS_PROPS_DISABLED=true
+          jf rt u "${PACKAGE_FILENAME}.asc" "${{ secrets.NPM_STAGING_ARTIFACTORY }}/${{ steps.published_pkg.outputs.artifact_path }}.asc" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token=${{ secrets.JFROG_PASSWORD }}
+
+      - name: Set CVE property in Artifactory
+        # Property is set on the signature file to prevent multiple calls
+        run: |
+          # Avoid setting additional vcs properties so that only one callback is executed
+          export JFROG_CLI_CI_VCS_PROPS_DISABLED=true
+          jf rt sp "${{ secrets.NPM_STAGING_ARTIFACTORY }}/${{ steps.published_pkg.outputs.artifact_path }}.asc" "fixed_cves=${{ github.event.inputs.fixed_cves }}" --url https://${{ secrets.JFROG_HOST_NAME }}/artifactory/ --access-token ${{ secrets.JFROG_PASSWORD }}
+
